@@ -1,69 +1,880 @@
-import Image from "next/image";
+'use client';
 
-export default function Home() {
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Check,
+  Plus,
+  Pencil,
+  Trash2,
+  Pill,
+  Clock,
+  Cloud,
+  CloudOff,
+  AlertTriangle,
+  Calendar as CalendarIcon,
+  RotateCcw,
+  X,
+  CheckCheck,
+} from 'lucide-react';
+import { supabase, isSupabaseConfigured } from '@/lib/supabase';
+
+export type TimeSlot = 'Sabah' | 'Öğle' | 'Akşam' | 'Gece';
+
+export interface Medication {
+  id: string;
+  name: string;
+  dosage_per_take: number;
+  time_slots: TimeSlot[];
+  notes: string;
+  current_stock: number | null;
+  is_active: boolean;
+}
+
+export interface MedicationLog {
+  id: string;
+  medication_id: string;
+  log_date: string;
+  time_slot: TimeSlot;
+  taken_count: number;
+  taken_at: string;
+}
+
+const TIME_SLOTS_ORDER: TimeSlot[] = ['Sabah', 'Öğle', 'Akşam', 'Gece'];
+
+const QUICK_NOTE_SUGGESTIONS = [
+  'Yemekten 1 saat sonra',
+  'Yemekten yarım saat önce',
+  'Aç karnına',
+  'Tok karnına',
+  'Yemekle birlikte',
+  'Bol su ile',
+];
+
+const INITIAL_MEDICATIONS: Medication[] = [
+  {
+    id: 'seed-pentasa',
+    name: 'Pentasa',
+    dosage_per_take: 3,
+    time_slots: ['Sabah', 'Akşam'],
+    notes: 'Yemekten 1 saat sonra',
+    current_stock: 120,
+    is_active: true,
+  },
+  {
+    id: 'seed-imuran',
+    name: 'Imuran',
+    dosage_per_take: 1,
+    time_slots: ['Sabah', 'Akşam'],
+    notes: 'Tok karnına',
+    current_stock: 60,
+    is_active: true,
+  },
+];
+
+const getLocalDateString = (date: Date): string => {
+  return date.toLocaleDateString('en-CA');
+};
+
+export default function PillTrackerApp() {
+  const [medications, setMedications] = useState<Medication[]>([]);
+  const [logs, setLogs] = useState<MedicationLog[]>([]);
+  const [todayDate, setTodayDate] = useState<string>('');
+  const [selectedDate, setSelectedDate] = useState<string>('');
+  const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'local'>('local');
+  const [isLoading, setIsLoading] = useState<boolean>(true);
+
+  const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
+  const [editingMed, setEditingMed] = useState<Medication | null>(null);
+
+  const [formName, setFormName] = useState<string>('');
+  const [formDosage, setFormDosage] = useState<number>(1);
+  const [formSlots, setFormSlots] = useState<TimeSlot[]>(['Sabah', 'Akşam']);
+  const [formNotes, setFormNotes] = useState<string>('');
+  const [formStock, setFormStock] = useState<string>('');
+
+  const weekDays = todayDate
+    ? Array.from({ length: 7 }, (_, i) => {
+        const d = new Date(`${todayDate}T00:00:00`);
+        d.setDate(d.getDate() - (6 - i));
+        return {
+          dateStr: getLocalDateString(d),
+          dayName: d.toLocaleDateString('tr-TR', { weekday: 'short' }),
+          dayNumber: d.getDate(),
+        };
+      })
+    : [];
+
+  const loadData = useCallback(async () => {
+    if (isSupabaseConfigured && supabase) {
+      setSyncStatus('syncing');
+      try {
+        const [{ data: medsData, error: medsErr }, { data: logsData, error: logsErr }] =
+          await Promise.all([
+            supabase.from('medications').select('*').eq('is_active', true).order('created_at'),
+            supabase.from('medication_logs').select('*'),
+          ]);
+
+        if (!medsErr && medsData) {
+          setMedications(medsData);
+          localStorage.setItem('pill_medications', JSON.stringify(medsData));
+        }
+        if (!logsErr && logsData) {
+          setLogs(logsData);
+          localStorage.setItem('pill_logs', JSON.stringify(logsData));
+        }
+        setSyncStatus('synced');
+      } catch (err) {
+        console.error('Supabase veri çekme hatası:', err);
+        setSyncStatus('local');
+      }
+    } else {
+      const savedMeds = localStorage.getItem('pill_medications');
+      const savedLogs = localStorage.getItem('pill_logs');
+
+      if (savedMeds) {
+        setMedications(JSON.parse(savedMeds));
+      } else {
+        setMedications(INITIAL_MEDICATIONS);
+        localStorage.setItem('pill_medications', JSON.stringify(INITIAL_MEDICATIONS));
+      }
+
+      if (savedLogs) {
+        setLogs(JSON.parse(savedLogs));
+      }
+      setSyncStatus('local');
+    }
+    setIsLoading(false);
+  }, []);
+
+  useEffect(() => {
+    let isActive = true;
+    queueMicrotask(() => {
+      if (isActive) {
+        const today = getLocalDateString(new Date());
+        setTodayDate(today);
+        setSelectedDate(today);
+        void loadData();
+      }
+    });
+
+    if (isSupabaseConfigured && supabase) {
+      const client = supabase;
+      const channel = client
+        .channel('realtime_pill_tracker')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'medications' }, () => {
+          if (isActive) void loadData();
+        })
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'medication_logs' }, () => {
+          if (isActive) void loadData();
+        })
+        .subscribe();
+
+      return () => {
+        isActive = false;
+        void client.removeChannel(channel);
+      };
+    }
+
+    return () => {
+      isActive = false;
+    };
+  }, [loadData]);
+
+  const toggleDose = async (med: Medication, slot: TimeSlot) => {
+    const existingLog = logs.find(
+      (l) => l.medication_id === med.id && l.log_date === selectedDate && l.time_slot === slot
+    );
+
+    if (existingLog) {
+      const updatedLogs = logs.filter((l) => l.id !== existingLog.id);
+      const updatedMeds = medications.map((m) =>
+        m.id === med.id && m.current_stock !== null
+          ? { ...m, current_stock: m.current_stock + existingLog.taken_count }
+          : m
+      );
+
+      setLogs(updatedLogs);
+      setMedications(updatedMeds);
+      localStorage.setItem('pill_logs', JSON.stringify(updatedLogs));
+      localStorage.setItem('pill_medications', JSON.stringify(updatedMeds));
+
+      if (isSupabaseConfigured && supabase) {
+        setSyncStatus('syncing');
+        await supabase.from('medication_logs').delete().eq('id', existingLog.id);
+        const targetMed = updatedMeds.find((m) => m.id === med.id);
+        if (targetMed && targetMed.current_stock !== null) {
+          await supabase
+            .from('medications')
+            .update({ current_stock: targetMed.current_stock })
+            .eq('id', med.id);
+        }
+        setSyncStatus('synced');
+      }
+    } else {
+      const newLog: MedicationLog = {
+        id: crypto.randomUUID(),
+        medication_id: med.id,
+        log_date: selectedDate,
+        time_slot: slot,
+        taken_count: med.dosage_per_take,
+        taken_at: new Date().toISOString(),
+      };
+
+      const updatedLogs = [...logs, newLog];
+      const updatedMeds = medications.map((m) =>
+        m.id === med.id && m.current_stock !== null
+          ? { ...m, current_stock: Math.max(0, m.current_stock - med.dosage_per_take) }
+          : m
+      );
+
+      setLogs(updatedLogs);
+      setMedications(updatedMeds);
+      localStorage.setItem('pill_logs', JSON.stringify(updatedLogs));
+      localStorage.setItem('pill_medications', JSON.stringify(updatedMeds));
+
+      if (isSupabaseConfigured && supabase) {
+        setSyncStatus('syncing');
+        const { data: inserted } = await supabase
+          .from('medication_logs')
+          .upsert(
+            {
+              medication_id: med.id,
+              log_date: selectedDate,
+              time_slot: slot,
+              taken_count: med.dosage_per_take,
+              taken_at: newLog.taken_at,
+            },
+            { onConflict: 'medication_id,log_date,time_slot' }
+          )
+          .select()
+          .single();
+
+        if (inserted) {
+          setLogs((prev) => prev.map((l) => (l.id === newLog.id ? inserted : l)));
+        }
+
+        const targetMed = updatedMeds.find((m) => m.id === med.id);
+        if (targetMed && targetMed.current_stock !== null) {
+          await supabase
+            .from('medications')
+            .update({ current_stock: targetMed.current_stock })
+            .eq('id', med.id);
+        }
+        setSyncStatus('synced');
+      }
+    }
+  };
+
+  const markAllSlotAsTaken = async (slot: TimeSlot, medsInSlot: Medication[]) => {
+    for (const med of medsInSlot) {
+      const isAlreadyTaken = logs.some(
+        (l) => l.medication_id === med.id && l.log_date === selectedDate && l.time_slot === slot
+      );
+      if (!isAlreadyTaken) {
+        await toggleDose(med, slot);
+      }
+    }
+  };
+
+  const openAddModal = () => {
+    setEditingMed(null);
+    setFormName('');
+    setFormDosage(1);
+    setFormSlots(['Sabah', 'Akşam']);
+    setFormNotes('');
+    setFormStock('');
+    setIsModalOpen(true);
+  };
+
+  const openEditModal = (med: Medication, e?: React.MouseEvent) => {
+    if (e) e.stopPropagation();
+    setEditingMed(med);
+    setFormName(med.name);
+    setFormDosage(med.dosage_per_take);
+    setFormSlots(med.time_slots);
+    setFormNotes(med.notes || '');
+    setFormStock(med.current_stock !== null ? String(med.current_stock) : '');
+    setIsModalOpen(true);
+  };
+
+  const toggleFormSlot = (slot: TimeSlot) => {
+    setFormSlots((prev) =>
+      prev.includes(slot) ? prev.filter((s) => s !== slot) : [...prev, slot]
+    );
+  };
+
+  const handleSaveMedication = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!formName.trim() || formSlots.length === 0) return;
+
+    const sortedSlots = TIME_SLOTS_ORDER.filter((s) => formSlots.includes(s));
+    const parsedStock = formStock.trim() !== '' ? parseInt(formStock, 10) : null;
+
+    if (editingMed) {
+      const updatedMed: Medication = {
+        ...editingMed,
+        name: formName.trim(),
+        dosage_per_take: formDosage,
+        time_slots: sortedSlots,
+        notes: formNotes.trim(),
+        current_stock: parsedStock,
+      };
+
+      const updatedList = medications.map((m) => (m.id === editingMed.id ? updatedMed : m));
+      setMedications(updatedList);
+      localStorage.setItem('pill_medications', JSON.stringify(updatedList));
+      setIsModalOpen(false);
+
+      if (isSupabaseConfigured && supabase) {
+        setSyncStatus('syncing');
+        await supabase
+          .from('medications')
+          .update({
+            name: updatedMed.name,
+            dosage_per_take: updatedMed.dosage_per_take,
+            time_slots: updatedMed.time_slots,
+            notes: updatedMed.notes,
+            current_stock: updatedMed.current_stock,
+          })
+          .eq('id', editingMed.id);
+        setSyncStatus('synced');
+      }
+    } else {
+      const newMed: Medication = {
+        id: crypto.randomUUID(),
+        name: formName.trim(),
+        dosage_per_take: formDosage,
+        time_slots: sortedSlots,
+        notes: formNotes.trim(),
+        current_stock: parsedStock,
+        is_active: true,
+      };
+
+      const updatedList = [...medications, newMed];
+      setMedications(updatedList);
+      localStorage.setItem('pill_medications', JSON.stringify(updatedList));
+      setIsModalOpen(false);
+
+      if (isSupabaseConfigured && supabase) {
+        setSyncStatus('syncing');
+        const { data: inserted } = await supabase
+          .from('medications')
+          .insert({
+            name: newMed.name,
+            dosage_per_take: newMed.dosage_per_take,
+            time_slots: newMed.time_slots,
+            notes: newMed.notes,
+            current_stock: newMed.current_stock,
+            is_active: true,
+          })
+          .select()
+          .single();
+
+        if (inserted) {
+          setMedications((prev) => prev.map((m) => (m.id === newMed.id ? inserted : m)));
+        }
+        setSyncStatus('synced');
+      }
+    }
+  };
+
+  const handleDeleteMedication = async (medId: string) => {
+    const updatedList = medications.filter((m) => m.id !== medId);
+    setMedications(updatedList);
+    localStorage.setItem('pill_medications', JSON.stringify(updatedList));
+    setIsModalOpen(false);
+
+    if (isSupabaseConfigured && supabase) {
+      setSyncStatus('syncing');
+      await supabase.from('medications').delete().eq('id', medId);
+      setSyncStatus('synced');
+    }
+  };
+
+  const totalScheduledDoses = medications.reduce((acc, m) => acc + m.time_slots.length, 0);
+  const totalScheduledPills = medications.reduce(
+    (acc, m) => acc + m.time_slots.length * m.dosage_per_take,
+    0
+  );
+
+  const logsForSelectedDate = logs.filter((l) => l.log_date === selectedDate);
+  const completedDosesCount = logsForSelectedDate.length;
+  const completedPillsCount = logsForSelectedDate.reduce((acc, l) => acc + l.taken_count, 0);
+
+  const progressPercentage =
+    totalScheduledDoses > 0 ? Math.round((completedDosesCount / totalScheduledDoses) * 100) : 0;
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center">
+        <div className="animate-pulse flex flex-col items-center gap-3">
+          <Pill className="w-10 h-10 text-emerald-400 animate-bounce" />
+          <p className="text-sm text-slate-400">İlaç listesi yükleniyor...</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+    <div className="min-h-screen bg-slate-950 text-slate-100 pb-28 selection:bg-emerald-500/30">
+      <div className="max-w-lg mx-auto px-4 pt-6">
+        <header className="flex items-center justify-between mb-5">
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
+              <Pill className="w-6 h-6 text-emerald-400" />
+              İlaç Takibim
+            </h1>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Günlük doz, öğün notu ve stok kontrolü
+            </p>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
+                syncStatus === 'synced'
+                  ? 'bg-emerald-950/60 border-emerald-800/70 text-emerald-300'
+                  : syncStatus === 'syncing'
+                  ? 'bg-amber-950/60 border-amber-800/70 text-amber-300'
+                  : 'bg-slate-900 border-slate-800 text-slate-400'
+              }`}
             >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
+              {syncStatus === 'synced' ? (
+                <>
+                  <Cloud className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Bulut Aktif</span>
+                </>
+              ) : syncStatus === 'syncing' ? (
+                <>
+                  <Cloud className="w-3.5 h-3.5 animate-pulse text-amber-400" />
+                  <span>Eşitleniyor...</span>
+                </>
+              ) : (
+                <>
+                  <CloudOff className="w-3.5 h-3.5 text-slate-500" />
+                  <span>Yerel Hafıza</span>
+                </>
+              )}
+            </div>
+
+            <button
+              onClick={openAddModal}
+              className="flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-400 active:scale-95 text-slate-950 font-semibold px-3.5 py-2 rounded-xl text-sm transition shadow-lg shadow-emerald-500/20"
             >
-              Learning
-            </a>{" "}
-            center.
-          </p>
+              <Plus className="w-4 h-4 stroke-[2.5]" />
+              <span>İlaç Ekle</span>
+            </button>
+          </div>
+        </header>
+
+        <div className="grid grid-cols-7 gap-1.5 mb-5 bg-slate-900/80 p-1.5 rounded-2xl border border-slate-800/80">
+          {weekDays.map((day) => {
+            const isSelected = day.dateStr === selectedDate;
+            const isToday = day.dateStr === todayDate;
+            return (
+              <button
+                key={day.dateStr}
+                onClick={() => setSelectedDate(day.dateStr)}
+                className={`flex flex-col items-center py-2 rounded-xl transition ${
+                  isSelected
+                    ? 'bg-emerald-500 text-slate-950 font-bold shadow-md shadow-emerald-500/20'
+                    : 'hover:bg-slate-800/70 text-slate-400'
+                }`}
+              >
+                <span className="text-[10px] uppercase tracking-wider opacity-80">
+                  {day.dayName}
+                </span>
+                <span className="text-base font-bold mt-0.5">{day.dayNumber}</span>
+                {isToday && (
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full mt-1 ${
+                      isSelected ? 'bg-slate-950' : 'bg-emerald-400'
+                    }`}
+                  />
+                )}
+              </button>
+            );
+          })}
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
+
+        <div className="bg-gradient-to-br from-slate-900 via-slate-900 to-emerald-950/40 border border-slate-800 rounded-2xl p-4 mb-6 shadow-lg">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <CalendarIcon className="w-4 h-4 text-emerald-400" />
+              <span className="text-sm font-semibold text-slate-200">
+                {selectedDate === todayDate ? 'Bugünkü İlerleme' : selectedDate}
+              </span>
+            </div>
+            <span className="text-xs font-bold px-2.5 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+              %{progressPercentage} Tamamlandı
+            </span>
+          </div>
+
+          <div className="w-full h-3 bg-slate-800 rounded-full overflow-hidden mb-2.5">
+            <div
+              className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-300 rounded-full"
+              style={{ width: `${progressPercentage}%` }}
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+          </div>
+
+          <div className="flex items-center justify-between text-xs text-slate-400">
+            <span>
+              Öğün Dozu: <strong className="text-slate-200">{completedDosesCount}</strong> /{' '}
+              {totalScheduledDoses}
+            </span>
+            <span>
+              Toplam İçilen Hap:{' '}
+              <strong className="text-emerald-400">{completedPillsCount}</strong> /{' '}
+              {totalScheduledPills} adet
+            </span>
+          </div>
         </div>
-      </main>
+
+        <div className="space-y-6">
+          {TIME_SLOTS_ORDER.map((slot) => {
+            const medsInSlot = medications.filter((m) => m.time_slots.includes(slot));
+            if (medsInSlot.length === 0) return null;
+
+            const allTakenInSlot = medsInSlot.every((m) =>
+              logsForSelectedDate.some((l) => l.medication_id === m.id && l.time_slot === slot)
+            );
+
+            return (
+              <section key={slot} className="space-y-3">
+                <div className="flex items-center justify-between px-1">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400" />
+                    <h2 className="text-base font-bold text-white tracking-wide">
+                      {slot} İlaçları
+                    </h2>
+                    <span className="text-xs text-slate-500 font-medium">
+                      ({medsInSlot.length} ilaç)
+                    </span>
+                  </div>
+
+                  {!allTakenInSlot && (
+                    <button
+                      onClick={() => markAllSlotAsTaken(slot, medsInSlot)}
+                      className="flex items-center gap-1 text-xs font-medium text-emerald-400 hover:text-emerald-300 transition"
+                    >
+                      <CheckCheck className="w-3.5 h-3.5" />
+                      <span>Tümünü İçtim</span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="space-y-2.5">
+                  {medsInSlot.map((med) => {
+                    const logEntry = logsForSelectedDate.find(
+                      (l) => l.medication_id === med.id && l.time_slot === slot
+                    );
+                    const isTaken = Boolean(logEntry);
+                    const takenTimeStr = logEntry
+                      ? new Date(logEntry.taken_at).toLocaleTimeString('tr-TR', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })
+                      : null;
+
+                    const isLowStock =
+                      med.current_stock !== null &&
+                      med.current_stock <= med.dosage_per_take * med.time_slots.length * 5;
+
+                    return (
+                      <div
+                        key={`${med.id}-${slot}`}
+                        onClick={() => toggleDose(med, slot)}
+                        className={`group relative rounded-2xl p-4 border transition-all cursor-pointer select-none ${
+                          isTaken
+                            ? 'bg-emerald-950/30 border-emerald-700/60 shadow-sm'
+                            : 'bg-slate-900/90 hover:bg-slate-900 border-slate-800'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex items-start gap-3.5 min-w-0 flex-1">
+                            <button
+                              type="button"
+                              aria-label={`${med.name} içildi işaretle`}
+                              className={`mt-0.5 w-8 h-8 rounded-xl flex items-center justify-center transition-all shrink-0 ${
+                                isTaken
+                                  ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-500/30 scale-105'
+                                  : 'bg-slate-800 border-2 border-slate-700 text-transparent group-hover:border-emerald-500/60'
+                              }`}
+                            >
+                              <Check className="w-5 h-5 stroke-[3]" />
+                            </button>
+
+                            <div className="min-w-0 flex-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span
+                                  className={`text-lg font-bold tracking-tight transition ${
+                                    isTaken ? 'line-through text-slate-400' : 'text-white'
+                                  }`}
+                                >
+                                  {med.name}
+                                </span>
+
+                                {med.notes && (
+                                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg text-xs font-semibold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                    <Clock className="w-3 h-3 shrink-0" />
+                                    {med.notes}
+                                  </span>
+                                )}
+                              </div>
+
+                              <div className="flex flex-wrap items-center gap-2 mt-2">
+                                <span
+                                  className={`inline-flex items-center px-2.5 py-0.5 rounded-md text-xs font-bold ${
+                                    isTaken
+                                      ? 'bg-emerald-500/20 text-emerald-300'
+                                      : 'bg-sky-500/15 text-sky-300 border border-sky-500/30'
+                                  }`}
+                                >
+                                  {logEntry ? logEntry.taken_count : med.dosage_per_take} Adet
+                                </span>
+
+                                {isTaken && takenTimeStr && (
+                                  <span className="text-xs font-medium text-emerald-400 flex items-center gap-1">
+                                    ✓ {takenTimeStr}&apos;de içildi
+                                  </span>
+                                )}
+
+                                {med.current_stock !== null && (
+                                  <span
+                                    className={`text-xs px-2 py-0.5 rounded-md flex items-center gap-1 ${
+                                      isLowStock
+                                        ? 'bg-rose-500/15 text-rose-300 border border-rose-500/30 font-semibold'
+                                        : 'text-slate-400 bg-slate-800/70'
+                                    }`}
+                                  >
+                                    {isLowStock && <AlertTriangle className="w-3 h-3" />}
+                                    Kalan: {med.current_stock} hap
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={(e) => openEditModal(med, e)}
+                            title="Dozu veya açıklamayı düzenle"
+                            className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-slate-800/90 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-medium border border-slate-700/80 transition shrink-0"
+                          >
+                            <Pencil className="w-3.5 h-3.5 text-emerald-400" />
+                            <span>Düzenle</span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            );
+          })}
+        </div>
+
+        <section className="mt-10 pt-6 border-t border-slate-800/80">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-bold uppercase tracking-wider text-slate-400">
+              Tanımlı İlaçlarım ve Günlük Dozlar
+            </h3>
+            <button
+              onClick={() => setSelectedDate(todayDate)}
+              className="text-xs text-emerald-400 hover:underline flex items-center gap-1"
+            >
+              <RotateCcw className="w-3 h-3" />
+              Bugüne Dön
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {medications.map((med) => (
+              <div
+                key={med.id}
+                className="flex items-center justify-between bg-slate-900/60 border border-slate-800/80 rounded-xl px-3.5 py-2.5"
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-semibold text-sm text-white">{med.name}</span>
+                    {med.notes && (
+                      <span className="text-xs text-amber-300 bg-amber-500/10 px-2 py-0.5 rounded-md border border-amber-500/20">
+                        {med.notes}
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    Günde {med.time_slots.length} defa ({med.time_slots.join(', ')}) • Seferde{' '}
+                    <strong className="text-slate-200">{med.dosage_per_take} adet</strong> (Günlük
+                    toplam {med.time_slots.length * med.dosage_per_take} adet)
+                  </p>
+                </div>
+
+                <button
+                  onClick={(e) => openEditModal(med, e)}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-medium text-emerald-400 transition shrink-0"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>Dozu / Notu Değiştir</span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
+
+      {isModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="bg-slate-900 border border-slate-800 w-full max-w-md rounded-t-3xl sm:rounded-3xl p-6 shadow-2xl">
+            <div className="flex items-center justify-between mb-5">
+              <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                <Pill className="w-5 h-5 text-emerald-400" />
+                {editingMed ? `${editingMed.name} Düzenle` : 'Yeni İlaç Ekle'}
+              </h2>
+              <button
+                onClick={() => setIsModalOpen(false)}
+                className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveMedication} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  İlaç Adı
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Örn: Pentasa, Imuran..."
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-amber-400 mb-1.5">
+                  İlaç Adının Yanında Görünecek Not (Opsiyonel)
+                </label>
+                <input
+                  type="text"
+                  placeholder="Örn: Yemekten 1 saat sonra, Aç karnına..."
+                  value={formNotes}
+                  onChange={(e) => setFormNotes(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-amber-500 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
+                />
+                <div className="flex flex-wrap gap-1.5 mt-2">
+                  {QUICK_NOTE_SUGGESTIONS.map((suggestion) => (
+                    <button
+                      type="button"
+                      key={suggestion}
+                      onClick={() => setFormNotes(suggestion)}
+                      className={`text-[11px] px-2.5 py-1 rounded-lg border transition ${
+                        formNotes === suggestion
+                          ? 'bg-amber-500/20 border-amber-500 text-amber-300 font-semibold'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {suggestion}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Hangi Öğünlerde İçilecek?
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  {TIME_SLOTS_ORDER.map((slot) => {
+                    const active = formSlots.includes(slot);
+                    return (
+                      <button
+                        type="button"
+                        key={slot}
+                        onClick={() => toggleFormSlot(slot)}
+                        className={`py-2.5 rounded-xl text-xs font-bold border transition ${
+                          active
+                            ? 'bg-emerald-500 text-slate-950 border-emerald-400 shadow-sm'
+                            : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                        }`}
+                      >
+                        {slot}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Her Öğünde Kaç Adet İçilecek?
+                </label>
+                <div className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-xl p-2">
+                  <button
+                    type="button"
+                    onClick={() => setFormDosage((d) => Math.max(1, d - 1))}
+                    className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold text-lg"
+                  >
+                    -
+                  </button>
+                  <div className="text-center">
+                    <span className="text-xl font-extrabold text-emerald-400">
+                      {formDosage} Adet
+                    </span>
+                    <p className="text-[11px] text-slate-400">
+                      Günlük toplam: {formDosage * formSlots.length} adet
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setFormDosage((d) => d + 1)}
+                    className="w-10 h-10 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold text-lg"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+                  Elimdeki Toplam Hap Sayısı (Opsiyonel Stok Takibi)
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  placeholder="Örn: 120"
+                  value={formStock}
+                  onChange={(e) => setFormStock(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-xl px-3.5 py-2.5 text-sm text-white outline-none"
+                />
+              </div>
+
+              <div className="flex items-center gap-2 pt-2">
+                {editingMed && (
+                  <button
+                    type="button"
+                    onClick={() => handleDeleteMedication(editingMed.id)}
+                    className="flex items-center justify-center gap-1.5 px-4 py-3 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 text-rose-400 font-semibold text-sm border border-rose-500/30 transition"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span>Sil</span>
+                  </button>
+                )}
+
+                <button
+                  type="submit"
+                  className="flex-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3 rounded-xl text-sm transition shadow-lg shadow-emerald-500/20"
+                >
+                  {editingMed ? 'Değişiklikleri Kaydet' : 'İlacı Ekle'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

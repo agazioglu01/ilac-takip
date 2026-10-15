@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
+import type { User } from '@supabase/supabase-js';
 import {
   Check,
   Plus,
@@ -15,6 +16,7 @@ import {
   RotateCcw,
   X,
   CheckCheck,
+  LogOut,
 } from 'lucide-react';
 import { supabase, isSupabaseConfigured } from '@/lib/supabase';
 
@@ -78,6 +80,20 @@ const getLocalDateString = (date: Date): string => {
 export default function PillTrackerApp() {
   const [medications, setMedications] = useState<Medication[]>([]);
   const [logs, setLogs] = useState<MedicationLog[]>([]);
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(!isSupabaseConfigured);
+  const [authError, setAuthError] = useState('');
+  const [authNotice, setAuthNotice] = useState('');
+  const [dataError, setDataError] = useState('');
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authView, setAuthView] = useState<'sign-in' | 'request-reset' | 'set-password'>(
+    'sign-in'
+  );
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const authenticatedUserId = authUser?.id;
   const [todayDate, setTodayDate] = useState<string>('');
   const [selectedDate, setSelectedDate] = useState<string>('');
   const [syncStatus, setSyncStatus] = useState<'synced' | 'syncing' | 'local'>('local');
@@ -104,47 +120,65 @@ export default function PillTrackerApp() {
       })
     : [];
 
-  const loadData = useCallback(async () => {
-    if (isSupabaseConfigured && supabase) {
-      setSyncStatus('syncing');
+  const persistLocalData = (nextMedications: Medication[], nextLogs: MedicationLog[]) => {
+    if (isSupabaseConfigured) return;
+    localStorage.setItem('pill_medications', JSON.stringify(nextMedications));
+    localStorage.setItem('pill_logs', JSON.stringify(nextLogs));
+  };
+
+  const loadData = useCallback(
+    async (userId?: string, isActive: () => boolean = () => true) => {
+      setIsLoading(true);
+      setDataError('');
       try {
-        const [{ data: medsData, error: medsErr }, { data: logsData, error: logsErr }] =
-          await Promise.all([
-            supabase.from('medications').select('*').eq('is_active', true).order('created_at'),
-            supabase.from('medication_logs').select('*'),
+        if (supabase) {
+          if (!userId) return;
+          setSyncStatus('syncing');
+          const [
+            { data: medsData, error: medsError },
+            { data: logsData, error: logsError },
+          ] = await Promise.all([
+            supabase
+              .from('medications')
+              .select('*')
+              .eq('user_id', userId)
+              .eq('is_active', true)
+              .order('created_at'),
+            supabase.from('medication_logs').select('*').eq('user_id', userId),
           ]);
 
-        if (!medsErr && medsData) {
-          setMedications(medsData);
-          localStorage.setItem('pill_medications', JSON.stringify(medsData));
-        }
-        if (!logsErr && logsData) {
-          setLogs(logsData);
-          localStorage.setItem('pill_logs', JSON.stringify(logsData));
-        }
-        setSyncStatus('synced');
-      } catch (err) {
-        console.error('Supabase veri çekme hatası:', err);
-        setSyncStatus('local');
-      }
-    } else {
-      const savedMeds = localStorage.getItem('pill_medications');
-      const savedLogs = localStorage.getItem('pill_logs');
+          if (medsError) throw medsError;
+          if (logsError) throw logsError;
+          if (!isActive()) return;
+          setMedications(medsData ?? []);
+          setLogs(logsData ?? []);
+          setSyncStatus('synced');
+        } else {
+          const savedMeds = localStorage.getItem('pill_medications');
+          const savedLogs = localStorage.getItem('pill_logs');
+          const nextMedications = savedMeds
+            ? (JSON.parse(savedMeds) as Medication[])
+            : INITIAL_MEDICATIONS;
+          const nextLogs = savedLogs ? (JSON.parse(savedLogs) as MedicationLog[]) : [];
 
-      if (savedMeds) {
-        setMedications(JSON.parse(savedMeds));
-      } else {
-        setMedications(INITIAL_MEDICATIONS);
-        localStorage.setItem('pill_medications', JSON.stringify(INITIAL_MEDICATIONS));
+          if (!isActive()) return;
+          setMedications(nextMedications);
+          setLogs(nextLogs);
+          persistLocalData(nextMedications, nextLogs);
+          setSyncStatus('local');
+        }
+      } catch (error) {
+        console.error('Veriler yüklenemedi:', error);
+        if (isActive()) {
+          setDataError('Veriler yüklenemedi. Bağlantını kontrol edip sayfayı yenile.');
+          setSyncStatus('local');
+        }
+      } finally {
+        if (isActive()) setIsLoading(false);
       }
-
-      if (savedLogs) {
-        setLogs(JSON.parse(savedLogs));
-      }
-      setSyncStatus('local');
-    }
-    setIsLoading(false);
-  }, []);
+    },
+    []
+  );
 
   useEffect(() => {
     let isActive = true;
@@ -153,32 +187,204 @@ export default function PillTrackerApp() {
         const today = getLocalDateString(new Date());
         setTodayDate(today);
         setSelectedDate(today);
-        void loadData();
       }
     });
-
-    if (isSupabaseConfigured && supabase) {
-      const client = supabase;
-      const channel = client
-        .channel('realtime_pill_tracker')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'medications' }, () => {
-          if (isActive) void loadData();
-        })
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'medication_logs' }, () => {
-          if (isActive) void loadData();
-        })
-        .subscribe();
-
-      return () => {
-        isActive = false;
-        void client.removeChannel(channel);
-      };
-    }
 
     return () => {
       isActive = false;
     };
-  }, [loadData]);
+  }, []);
+
+  useEffect(() => {
+    const client = supabase;
+    if (!client) return;
+
+    let isActive = true;
+    const {
+      data: { subscription },
+    } = client.auth.onAuthStateChange((event, session) => {
+      if (!isActive) return;
+      setAuthUser(session?.user ?? null);
+      setAuthError('');
+      if (event === 'PASSWORD_RECOVERY') {
+        setAuthView('set-password');
+        setAuthNotice('');
+      }
+      setMedications([]);
+      setLogs([]);
+      setIsLoading(true);
+    });
+
+    void client.auth
+      .getSession()
+      .then(({ data, error }) => {
+        if (!isActive) return;
+        if (error) {
+          console.error('Oturum bilgisi alınamadı:', error);
+          setAuthError('Oturum bilgisi alınamadı. Sayfayı yenileyip tekrar dene.');
+          setAuthUser(null);
+        } else {
+          setAuthUser(data.session?.user ?? null);
+        }
+        setAuthReady(true);
+      })
+      .catch((error: unknown) => {
+        if (!isActive) return;
+        console.error('Oturum bilgisi alınamadı:', error);
+        setAuthError('Oturum bilgisi alınamadı. Sayfayı yenileyip tekrar dene.');
+        setAuthUser(null);
+        setAuthReady(true);
+      });
+
+    return () => {
+      isActive = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!authReady) return;
+    let isActive = true;
+    if (isSupabaseConfigured && !authenticatedUserId) {
+      queueMicrotask(() => {
+        if (isActive) setIsLoading(false);
+      });
+      return () => {
+        isActive = false;
+      };
+    }
+
+    queueMicrotask(() => {
+      if (isActive) void loadData(authenticatedUserId, () => isActive);
+    });
+    return () => {
+      isActive = false;
+    };
+  }, [authReady, authenticatedUserId, loadData]);
+
+  useEffect(() => {
+    const client = supabase;
+    if (!client || !authUser) return;
+
+    let isActive = true;
+    const filter = `user_id=eq.${authUser.id}`;
+    const channel = client
+      .channel(`realtime_pill_tracker_${authUser.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'medications', filter },
+        () => {
+          if (isActive) void loadData(authUser.id, () => isActive);
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'medication_logs', filter },
+        () => {
+          if (isActive) void loadData(authUser.id, () => isActive);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      isActive = false;
+      void client.removeChannel(channel);
+    };
+  }, [authUser, loadData]);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    const hashParams = new URLSearchParams(window.location.hash.slice(1));
+    if (hashParams.get('error_code') !== 'otp_expired') return;
+
+    queueMicrotask(() => {
+      setAuthView('request-reset');
+      setAuthError('Bağlantının süresi dolmuş veya daha önce kullanılmış. Yeni bir parola sıfırlama e-postası iste.');
+    });
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+  }, []);
+
+  const handleSignIn = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase) {
+      setAuthError('Supabase ayarları bulunamadı.');
+      return;
+    }
+    setAuthBusy(true);
+    setAuthError('');
+    const { error } = await supabase.auth.signInWithPassword({
+      email: loginEmail.trim(),
+      password: loginPassword,
+    });
+    setAuthBusy(false);
+    if (error) {
+      console.error('Giriş başarısız:', error);
+      setAuthError('Giriş yapılamadı. E-posta ve parolanı kontrol et.');
+    } else {
+      setLoginPassword('');
+    }
+  };
+
+  const handleRequestPasswordReset = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase) {
+      setAuthError('Supabase ayarları bulunamadı.');
+      return;
+    }
+    setAuthBusy(true);
+    setAuthError('');
+    setAuthNotice('');
+    const { error } = await supabase.auth.resetPasswordForEmail(loginEmail.trim(), {
+      redirectTo: window.location.origin,
+    });
+    setAuthBusy(false);
+    if (error) {
+      console.error('Parola sıfırlama e-postası gönderilemedi:', error);
+      setAuthError(`Parola sıfırlama e-postası gönderilemedi: ${error.message}`);
+      return;
+    }
+    setAuthNotice('Adres kayıtlıysa parola yenileme bağlantısı gönderildi. Gelen kutusu ve spam klasörünü kontrol et.');
+  };
+
+  const handleUpdatePassword = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!supabase) {
+      setAuthError('Supabase ayarları bulunamadı.');
+      return;
+    }
+    if (newPassword.length < 8) {
+      setAuthError('Yeni parola en az 8 karakter olmalı.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setAuthError('Parolalar eşleşmiyor.');
+      return;
+    }
+
+    setAuthBusy(true);
+    setAuthError('');
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    setAuthBusy(false);
+    if (error) {
+      console.error('Parola güncellenemedi:', error);
+      setAuthError('Parola güncellenemedi. Sıfırlama bağlantısının süresi dolmuş olabilir; yeni bir bağlantı iste.');
+      return;
+    }
+    setNewPassword('');
+    setConfirmPassword('');
+    setAuthView('sign-in');
+    setAuthNotice('Parolan güncellendi. Artık yeni parolanla giriş yapabilirsin.');
+    await supabase.auth.signOut();
+  };
+
+  const handleSignOut = async () => {
+    if (!supabase) return;
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      console.error('Oturum kapatılamadı:', error);
+      setAuthError('Oturum kapatılamadı. Tekrar dene.');
+    }
+  };
 
   const toggleDose = async (med: Medication, slot: TimeSlot) => {
     const existingLog = logs.find(
@@ -195,8 +401,7 @@ export default function PillTrackerApp() {
 
       setLogs(updatedLogs);
       setMedications(updatedMeds);
-      localStorage.setItem('pill_logs', JSON.stringify(updatedLogs));
-      localStorage.setItem('pill_medications', JSON.stringify(updatedMeds));
+      persistLocalData(updatedMeds, updatedLogs);
 
       if (isSupabaseConfigured && supabase) {
         setSyncStatus('syncing');
@@ -229,8 +434,7 @@ export default function PillTrackerApp() {
 
       setLogs(updatedLogs);
       setMedications(updatedMeds);
-      localStorage.setItem('pill_logs', JSON.stringify(updatedLogs));
-      localStorage.setItem('pill_medications', JSON.stringify(updatedMeds));
+      persistLocalData(updatedMeds, updatedLogs);
 
       if (isSupabaseConfigured && supabase) {
         setSyncStatus('syncing');
@@ -322,7 +526,7 @@ export default function PillTrackerApp() {
 
       const updatedList = medications.map((m) => (m.id === editingMed.id ? updatedMed : m));
       setMedications(updatedList);
-      localStorage.setItem('pill_medications', JSON.stringify(updatedList));
+      persistLocalData(updatedList, logs);
       setIsModalOpen(false);
 
       if (isSupabaseConfigured && supabase) {
@@ -352,7 +556,7 @@ export default function PillTrackerApp() {
 
       const updatedList = [...medications, newMed];
       setMedications(updatedList);
-      localStorage.setItem('pill_medications', JSON.stringify(updatedList));
+      persistLocalData(updatedList, logs);
       setIsModalOpen(false);
 
       if (isSupabaseConfigured && supabase) {
@@ -381,7 +585,9 @@ export default function PillTrackerApp() {
   const handleDeleteMedication = async (medId: string) => {
     const updatedList = medications.filter((m) => m.id !== medId);
     setMedications(updatedList);
-    localStorage.setItem('pill_medications', JSON.stringify(updatedList));
+    const updatedLogs = logs.filter((log) => log.medication_id !== medId);
+    setLogs(updatedLogs);
+    persistLocalData(updatedList, updatedLogs);
     setIsModalOpen(false);
 
     if (isSupabaseConfigured && supabase) {
@@ -404,7 +610,62 @@ export default function PillTrackerApp() {
   const progressPercentage =
     totalScheduledDoses > 0 ? Math.round((completedDosesCount / totalScheduledDoses) * 100) : 0;
 
-  if (isLoading) {
+  if (isSupabaseConfigured && authView === 'set-password') {
+    return (
+      <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-4">
+        <form
+          onSubmit={handleUpdatePassword}
+          className="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl"
+        >
+          <div className="mb-6 text-center">
+            <Pill className="mx-auto mb-3 h-9 w-9 text-emerald-400" />
+            <h1 className="text-xl font-bold text-white">Yeni parola belirle</h1>
+            <p className="mt-1 text-sm text-slate-400">Hesabın için yeni bir parola oluştur.</p>
+          </div>
+          <label htmlFor="new-password" className="mb-1.5 block text-sm text-slate-300">
+            Yeni parola
+          </label>
+          <input
+            id="new-password"
+            type="password"
+            autoComplete="new-password"
+            minLength={8}
+            required
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+            className="mb-4 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-white outline-none focus:border-emerald-500"
+          />
+          <label htmlFor="confirm-password" className="mb-1.5 block text-sm text-slate-300">
+            Yeni parola (tekrar)
+          </label>
+          <input
+            id="confirm-password"
+            type="password"
+            autoComplete="new-password"
+            minLength={8}
+            required
+            value={confirmPassword}
+            onChange={(event) => setConfirmPassword(event.target.value)}
+            className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-white outline-none focus:border-emerald-500"
+          />
+          {authError && (
+            <p role="alert" className="mt-4 rounded-lg bg-red-950/60 px-3 py-2 text-sm text-red-300">
+              {authError}
+            </p>
+          )}
+          <button
+            type="submit"
+            disabled={authBusy}
+            className="mt-5 w-full rounded-lg bg-emerald-500 px-4 py-2.5 font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {authBusy ? 'Parola güncelleniyor...' : 'Parolayı güncelle'}
+          </button>
+        </form>
+      </main>
+    );
+  }
+
+  if (!authReady || isLoading) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center">
         <div className="animate-pulse flex flex-col items-center gap-3">
@@ -412,6 +673,97 @@ export default function PillTrackerApp() {
           <p className="text-sm text-slate-400">İlaç listesi yükleniyor...</p>
         </div>
       </div>
+    );
+  }
+
+  if (isSupabaseConfigured && !authUser) {
+    return (
+      <main className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center px-4">
+        <form
+          onSubmit={
+            authView === 'request-reset' ? handleRequestPasswordReset : handleSignIn
+          }
+          className="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl"
+        >
+          <div className="mb-6 text-center">
+            <Pill className="mx-auto mb-3 h-9 w-9 text-emerald-400" />
+            <h1 className="text-xl font-bold text-white">
+              {authView === 'request-reset' ? 'Parolanı yenile' : 'İlaç Takibim'}
+            </h1>
+            <p className="mt-1 text-sm text-slate-400">
+              {authView === 'request-reset'
+                ? 'Parola yenileme bağlantısını e-posta adresine gönderelim.'
+                : 'Devam etmek için hesabınla giriş yap.'}
+            </p>
+          </div>
+
+          <label htmlFor="login-email" className="mb-1.5 block text-sm text-slate-300">
+            E-posta
+          </label>
+          <input
+            id="login-email"
+            type="email"
+            autoComplete="username"
+            required
+            value={loginEmail}
+            onChange={(event) => setLoginEmail(event.target.value)}
+            className="mb-4 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-white outline-none focus:border-emerald-500"
+          />
+
+          {authView === 'sign-in' && (
+            <>
+              <label htmlFor="login-password" className="mb-1.5 block text-sm text-slate-300">
+                Parola
+              </label>
+              <input
+                id="login-password"
+                type="password"
+                autoComplete="current-password"
+                required
+                value={loginPassword}
+                onChange={(event) => setLoginPassword(event.target.value)}
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-white outline-none focus:border-emerald-500"
+              />
+            </>
+          )}
+
+          {authError && (
+            <p role="alert" className="mt-4 rounded-lg bg-red-950/60 px-3 py-2 text-sm text-red-300">
+              {authError}
+            </p>
+          )}
+          {authNotice && (
+            <p role="status" className="mt-4 rounded-lg bg-emerald-950/60 px-3 py-2 text-sm text-emerald-300">
+              {authNotice}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={authBusy}
+            className="mt-5 w-full rounded-lg bg-emerald-500 px-4 py-2.5 font-semibold text-slate-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {authBusy
+              ? authView === 'request-reset'
+                ? 'E-posta gönderiliyor...'
+                : 'Giriş yapılıyor...'
+              : authView === 'request-reset'
+                ? 'Yenileme bağlantısı gönder'
+                : 'Giriş yap'}
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setAuthView(authView === 'request-reset' ? 'sign-in' : 'request-reset');
+              setAuthError('');
+              setAuthNotice('');
+            }}
+            className="mt-4 w-full text-center text-sm text-slate-400 underline-offset-4 hover:text-white hover:underline"
+          >
+            {authView === 'request-reset' ? 'Giriş ekranına dön' : 'Parolamı unuttum'}
+          </button>
+        </form>
+      </main>
     );
   }
 
@@ -464,8 +816,24 @@ export default function PillTrackerApp() {
               <Plus className="w-4 h-4 stroke-[2.5]" />
               <span>İlaç Ekle</span>
             </button>
+            {authUser && (
+              <button
+                onClick={handleSignOut}
+                aria-label="Oturumu kapat"
+                title={authUser.email ?? 'Oturumu kapat'}
+                className="rounded-xl border border-slate-700 p-2 text-slate-300 transition hover:border-slate-500 hover:text-white"
+              >
+                <LogOut className="h-4 w-4" />
+              </button>
+            )}
           </div>
         </header>
+
+        {dataError && (
+          <p role="alert" className="mb-4 rounded-xl border border-red-900 bg-red-950/50 px-4 py-3 text-sm text-red-200">
+            {dataError}
+          </p>
+        )}
 
         <div className="grid grid-cols-7 gap-1.5 mb-5 bg-slate-900/80 p-1.5 rounded-2xl border border-slate-800/80">
           {weekDays.map((day) => {

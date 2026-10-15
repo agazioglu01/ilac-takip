@@ -1,5 +1,11 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+## Local-only mode
+
+Supabase authentication and cloud sync are disabled by default. In this mode, medication data is saved only in the current browser's local storage and is not synchronized between devices.
+
+To enable Supabase authentication and cloud sync, add `NEXT_PUBLIC_ENABLE_SUPABASE_AUTH=true` to `.env.local` alongside the Supabase project URL and public key, then restart the development server. Keep row-level security enabled in Supabase and never expose a service-role key in client environment variables.
+
 ## Getting Started
 
 First, run the development server:

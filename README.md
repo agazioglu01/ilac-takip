@@ -6,6 +6,8 @@ Supabase authentication and cloud sync are disabled by default. In this mode, me
 
 To enable Supabase authentication and cloud sync, add `NEXT_PUBLIC_ENABLE_SUPABASE_AUTH=true` to `.env.local` alongside the Supabase project URL and public key, then restart the development server. Keep row-level security enabled in Supabase and never expose a service-role key in client environment variables.
 
+On the sign-in screen, **Beni hatırla** keeps the Supabase session in browser storage so you stay signed in after closing the browser. If it is unchecked, the session lasts only for the current browser tab.
+
 ## Getting Started
 
 First, run the development server:

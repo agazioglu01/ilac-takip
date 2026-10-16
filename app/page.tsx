@@ -18,7 +18,12 @@ import {
   CheckCheck,
   LogOut,
 } from 'lucide-react';
-import { supabase, isSupabaseConfigured } from '@/lib/supabase';
+import {
+  supabase,
+  isSupabaseConfigured,
+  getRememberMePreference,
+  setRememberMePreference,
+} from '@/lib/supabase';
 
 export type TimeSlot = 'Sabah' | 'Öğle' | 'Akşam' | 'Gece';
 
@@ -86,6 +91,7 @@ export default function PillTrackerApp() {
   const [authNotice, setAuthNotice] = useState('');
   const [dataError, setDataError] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
   const [authView, setAuthView] = useState<'sign-in' | 'request-reset' | 'set-password'>(
     'sign-in'
   );
@@ -193,6 +199,10 @@ export default function PillTrackerApp() {
     return () => {
       isActive = false;
     };
+  }, []);
+
+  useEffect(() => {
+    queueMicrotask(() => setRememberMe(getRememberMePreference()));
   }, []);
 
   useEffect(() => {
@@ -312,6 +322,7 @@ export default function PillTrackerApp() {
     }
     setAuthBusy(true);
     setAuthError('');
+    setRememberMePreference(rememberMe);
     const { error } = await supabase.auth.signInWithPassword({
       email: loginEmail.trim(),
       password: loginPassword,
@@ -724,6 +735,19 @@ export default function PillTrackerApp() {
                 onChange={(event) => setLoginPassword(event.target.value)}
                 className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-white outline-none focus:border-emerald-500"
               />
+              <label
+                htmlFor="remember-me"
+                className="mt-4 flex w-fit cursor-pointer items-center gap-2 text-sm text-slate-300"
+              >
+                <input
+                  id="remember-me"
+                  type="checkbox"
+                  checked={rememberMe}
+                  onChange={(event) => setRememberMe(event.target.checked)}
+                  className="h-4 w-4 accent-emerald-500"
+                />
+                Beni hatırla
+              </label>
             </>
           )}
 

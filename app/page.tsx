@@ -346,7 +346,7 @@ export default function PillTrackerApp() {
     setAuthError('');
     setAuthNotice('');
     const { error } = await supabase.auth.resetPasswordForEmail(loginEmail.trim(), {
-      redirectTo: window.location.origin,
+      redirectTo: `${window.location.origin}${window.location.pathname}`,
     });
     setAuthBusy(false);
     if (error) {
